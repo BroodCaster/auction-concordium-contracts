@@ -1,6 +1,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use concordium_std::*;
+type ContractTokenId = TokenIdU8; // Define ContractTokenId as an alias for TokenIdU8
+type ContractTokenAmount = TokenAmountU64; // Define ContractTokenAmount as an alias for TokenAmountU64
+use concordium_cis2::{AdditionalData, Cis2Client, Cis2ClientError, OnReceivingCis2Params, Receiver, TokenAmountU64, TokenIdU8, Transfer, TransferParams};
+
 
 /// The state of an auction.
 #[derive(Debug, Serialize, SchemaType, Eq, PartialEq, PartialOrd, Clone)]
@@ -29,6 +33,9 @@ pub struct Auction {
     item: String,
     end: Timestamp,
     owner: AccountAddress,
+    token_contract: ContractAddress, // CIS-2 token contract address
+    token_id: TokenIdU8,               // CIS-2 token ID
+    token_amount: TokenAmountU64,               // Amount of tokens
 }
 
 /// The state of the smart contract.
@@ -44,6 +51,9 @@ pub struct NewAuctionParameter {
     pub item: String,
     pub end: Timestamp,
     pub initial_price: u64,
+    pub token_contract: ContractAddress, // CIS-2 token contract address
+    pub token_id: TokenIdU8,              // CIS-2 token ID
+    pub token_amount: TokenAmountU64,              // Amount of tokens
 }
 
 /// Type of the parameter to place a bid.
@@ -73,13 +83,29 @@ pub fn create_auction(
     ctx: &impl HasReceiveContext,
     host: &mut Host<State>,
     logger: &mut impl HasLogger,
-) -> Result<(), ()> {
-    let parameter: NewAuctionParameter = ctx.parameter_cursor().get().map_err(|_| ())?;
+) -> Result<(), BidError> {
+    let parameter: NewAuctionParameter = ctx.parameter_cursor().get().map_err(|_| BidError::ParameterParsingError)?;
 
     let owner = match ctx.sender() {
         Address::Account(account_address) => account_address,
-        _ => return Err(()), // Only accounts can create auctions
+        _ => return Err(BidError::OnlyAccount), // Only accounts can create auctions
     };
+
+    // Transfer CIS-2 tokens from the auction creator to the contract
+     let transfer = Transfer {
+        token_id: parameter.token_id,
+        amount: parameter.token_amount,
+        from: Address::Account(owner),
+        to: Receiver::from_contract(ctx.self_address(), OwnedEntrypointName::new_unchecked("onReceivingCIS2".to_string())),
+        data: AdditionalData::empty(),
+    };
+
+    let client = Cis2Client::new(ContractAddress::new(parameter.token_contract.index, parameter.token_contract.subindex));
+    let result: Result<bool, Cis2ClientError<()>> = client.transfer(host, transfer);
+    // if let Err(err) = &result {
+    //     logger.log(&format!("Transfer failed: {:?}", err)).map_err(|_| BidError::TransferFailed)?;
+    //     return Err(BidError::TransferFailed);
+    // }
 
     let auction = Auction {
         auction_state: AuctionState::NotSoldYet,
@@ -88,7 +114,10 @@ pub fn create_auction(
         highest_bid: Amount::zero(),
         item: parameter.item,
         end: parameter.end,
-        owner, // Set the owner of the auction
+        owner,
+        token_contract: parameter.token_contract,
+        token_id: parameter.token_id,
+        token_amount: parameter.token_amount,
     };
 
     // Add the new auction to the array
@@ -97,10 +126,37 @@ pub fn create_auction(
 
     // Return the ID of the newly created auction
     let id = (state.auctions.len() - 1) as u32;
-    // logger.log(&AuctionEvent::Register(AuctionEventData {
-    //     auction_id: auction_id,
-    // }))?;
-    logger.log(&AuctionEvent::Register(AuctionEventData{ auction_id: id })).map_err(|_| ())?;
+    logger.log(&AuctionEvent::Register(AuctionEventData { auction_id: id })).map_err(|_| BidError::TransferFailed)?;
+    Ok(())
+}
+
+/// Function to handle receiving CIS-2 tokens.
+#[receive(contract = "auction", name = "onReceivingCIS2", mutable)]
+pub fn on_receiving_cis2(
+    ctx: &impl HasReceiveContext,
+    host: &mut Host<State>
+) -> Result<(), ()> {
+    // // Get information about received tokens
+    // let params: OnReceivingCis2Params<ContractTokenId, ContractTokenAmount> = ctx.parameter_cursor().get().map_err(|_| ())?;
+
+    // // Get the token contract that sent the tokens
+    // let token_contract = match ctx.sender() {
+    //     Address::Contract(contract) => contract,
+    //     _ => return Ok(()), // Non-contract senders are ignored
+    // };
+
+    // // Find the auction that matches the token contract and token ID
+    // let state = host.state_mut();
+    // if let Some(auction) = state.auctions.iter_mut().find(|auction| {
+    //     auction.token_contract == token_contract && auction.token_id == params.token_id
+    // }) {
+    //     // Assign the received tokens to the auction
+    //     auction.token_amount = params.amount;
+    // } else {
+    //     // If no matching auction is found, return an error
+    //     return Err(());
+    // }
+
     Ok(())
 }
 
@@ -184,40 +240,59 @@ pub fn get_auction(
     Ok(auction.clone())
 }
 
-
 /// `finalize` function to finalize a specific auction.
-#[receive(contract = "auction", name = "finalize", parameter = "BidParameter", mutable, error = "BidError")]
-pub fn auction_finalize(ctx: &impl HasReceiveContext, host: &mut Host<State>) -> Result<(), BidError> {
+#[receive(contract = "auction", name = "finalize", parameter = "BidParameter", enable_logger, mutable, error = "BidError")]
+pub fn auction_finalize(ctx: &impl HasReceiveContext, host: &mut Host<State>, logger: &mut impl HasLogger,) -> Result<(), BidError> {
     let parameter: BidParameter = ctx.parameter_cursor().get().map_err(|_| BidError::ParameterParsingError)?;
 
     let commission_recipient = host.state().commission_recipient;
-    // Get mutable access to the auction, and ensure it exists
-    let auction = {
-        let auctions = &mut host.state_mut().auctions;
-        auctions.get_mut(parameter.auction_id as usize).ok_or(BidError::AuctionNotFound)?
-    };
+    let auction = host.state().auctions.get(parameter.auction_id as usize).ok_or(BidError::AuctionNotFound)?.clone();
+    // let auction = {
+    //     let auctions = &mut host.state_mut().auctions;
+    //     auctions.get_mut(parameter.auction_id as usize).ok_or(BidError::AuctionNotFound)?
+    // };
 
-    // Ensure the auction has not been finalized yet
     ensure_eq!(auction.auction_state, AuctionState::NotSoldYet, BidError::AuctionAlreadyFinalized);
 
     let slot_time = ctx.metadata().slot_time();
-    // Ensure the auction has ended already
     ensure!(slot_time > auction.end, BidError::AuctionStillActive);
 
     if let Some(winning_bidder) = auction.highest_bidder {
-        // Calculate the commission (10%)
         let commission = auction.highest_bid.micro_ccd / 10;
         let commission_amount = Amount::from_micro_ccd(commission);
         let owner_amount = auction.highest_bid - commission_amount;
 
-        // Mark the auction as sold
-        auction.auction_state = AuctionState::Sold(winning_bidder);
-        
+        // auction.auction_state = AuctionState::Sold(winning_bidder);
 
-        // Send the remaining amount to the auction's owner
-        let owner = auction.owner;
+        // Transfer CIS-2 tokens to the highest bidder
+        let transfer: Transfer<TokenIdU8, TokenAmountU64> = Transfer {
+            token_id: auction.token_id,
+            amount: auction.token_amount.into(),
+            from: Address::Contract(ctx.self_address()),
+            to: Receiver::from_account(winning_bidder),
+            data: AdditionalData::empty(),
+        };
+        let client = Cis2Client::new(ContractAddress::new(auction.token_contract.index, auction.token_contract.subindex));
+        let result: Result<bool, Cis2ClientError<()>> = client.transfer(host, transfer);
+
+        logger.log(&format!("{:?}", result)).map_err(|_| BidError::TransferFailed)?;
+
         host.invoke_transfer(&commission_recipient, commission_amount).map_err(|_| BidError::TransferFailed)?;
-        host.invoke_transfer(&owner, owner_amount).map_err(|_| BidError::TransferFailed)?;
+        host.invoke_transfer(&auction.owner, owner_amount).map_err(|_| BidError::TransferFailed)?;
+    } else {
+        // Return CIS-2 tokens to the auction creator
+        let transfer: Transfer<TokenIdU8, TokenAmountU64> = Transfer {
+            token_id: auction.token_id,
+            amount: auction.token_amount.into(),
+            from: Address::Contract(ctx.self_address()),
+            to: Receiver::from_account(auction.owner),
+            data: AdditionalData::empty(),
+        };
+
+        let client = Cis2Client::new(ContractAddress::new(auction.token_contract.index, auction.token_contract.subindex));
+        let result: Result<bool, Cis2ClientError<()>> = client.transfer(host, transfer);
+
+        logger.log(&format!("{:?}", result)).map_err(|_| BidError::TransferFailed)?;
     }
 
     Ok(())
